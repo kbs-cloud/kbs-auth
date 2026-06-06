@@ -29,3 +29,6 @@ kbs_auth.db
 # Commit & Changelog drafts
 NEXT_COMMIT.txt
 NEXT_CHANGELOG.md
+
+# Local deploy script
+deploy.sh
