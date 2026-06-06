@@ -280,7 +280,9 @@ app.post('/api/auth/login', (req, res) => {
           success: true,
           user: {
             email: user.email,
-            displayName: user.display_name || null
+            displayName: user.display_name || null,
+            isGoogleLinked: user.is_google_linked === 1,
+            hasPassword: !!user.password_hash
           }
         };
 
