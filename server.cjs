@@ -24,6 +24,30 @@ app.set('trust proxy', 1);
 const PORT = process.env.BACKEND_PORT || process.env.PORT || 29001;
 const JWT_SECRET = process.env.JWT_SECRET || 'kbs-cloud-sso-secret-key-12345';
 
+// Generate RS256 key pair for Back-Channel SLO
+const { generateKeyPairSync } = require('crypto');
+let privateKeyPem;
+let publicKeyPem;
+
+try {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: {
+      type: 'spki',
+      format: 'pem'
+    },
+    privateKeyEncoding: {
+      type: 'pkcs8',
+      format: 'pem'
+    }
+  });
+  privateKeyPem = privateKey;
+  publicKeyPem = publicKey;
+  console.log('Successfully generated RSA key pair for Back-Channel SLO.');
+} catch (keyErr) {
+  console.error('Failed to generate RSA key pair:', keyErr.message);
+}
+
 // Database Connection
 const dbPath = path.join(__dirname, 'kbs_auth.db');
 const db = new sqlite3.Database(dbPath, (err) => {
@@ -31,6 +55,9 @@ const db = new sqlite3.Database(dbPath, (err) => {
     console.error('Failed to connect to SQLite database:', err.message);
   } else {
     console.log('Connected to SQLite database at:', dbPath);
+    db.run('PRAGMA foreign_keys = ON', (pragmaErr) => {
+      if (pragmaErr) console.error('Failed to enable foreign keys:', pragmaErr.message);
+    });
     initializeTables();
   }
 });
@@ -55,6 +82,16 @@ function initializeTables() {
         email TEXT,
         expires_at DATETIME,
         FOREIGN KEY(email) REFERENCES users(email) ON DELETE CASCADE
+      )
+    `);
+
+    // Session Clients mapping table for SLO
+    db.run(`
+      CREATE TABLE IF NOT EXISTS session_clients (
+        sso_session_id TEXT,
+        client_id TEXT,
+        PRIMARY KEY (sso_session_id, client_id),
+        FOREIGN KEY(sso_session_id) REFERENCES sessions(id) ON DELETE CASCADE
       )
     `);
 
@@ -185,6 +222,12 @@ app.get('/api/auth/authorize', (req, res) => {
       return res.redirect(loginUrl);
     }
 
+    // Register active client for this SSO session
+    const sessionId = req.cookies['sso_session_id'];
+    if (sessionId) {
+      db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
+    }
+
     // Already logged in! Generate authorization code and redirect back instantly
     createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
       if (codeErr) {
@@ -303,6 +346,8 @@ app.post('/api/auth/login', (req, res) => {
 
         // If authorization parameters exist, generate redirect URI with code
         if (client_id && redirect_uri) {
+          db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
+
           createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
             if (codeErr) {
               return res.status(500).json({ error: 'Failed to create login redirect code.' });
@@ -408,24 +453,128 @@ app.post('/api/auth/change-password', (req, res) => {
   });
 });
 
+// Helper: Resolve backend URL for SLO back-channel requests
+function getAppLogoutUrl(clientId) {
+  // If the auth server runs on port 20001 (or starts with 20), use the 2000x port range for back-channel calls.
+  // Otherwise, default to the 2900x port range.
+  const isProductionRange = (PORT === 20001 || String(PORT).startsWith('20'));
+  const portOffset = isProductionRange ? 20000 : 29000;
+
+  const clientConfigMap = {
+    'kbs-cloud': 0,
+    'starswarm': 2,
+    'tickerclash': 3,
+    'alchemist': 4,
+    'gridlock-neon': 5
+  };
+
+  const offset = clientConfigMap[clientId];
+  if (offset === undefined) return null;
+
+  const port = portOffset + offset;
+  return `http://localhost:${port}/api/auth/backchannel-logout`;
+}
+
+
+// Endpoint to retrieve public key for signature verification
+app.get('/api/auth/certs', (req, res) => {
+  if (!publicKeyPem) {
+    return res.status(500).json({ error: 'RSA public key not initialized.' });
+  }
+  res.status(200).json({ keys: [{ kid: 'sso-key-1', pem: publicKeyPem }] });
+});
+
 // 6. Central Logout
 app.all('/api/auth/logout', (req, res) => {
   const sessionId = req.cookies['sso_session_id'];
-  if (sessionId) {
-    db.run('DELETE FROM sessions WHERE id = ?', [sessionId]);
+
+  const finishLogout = () => {
+    res.clearCookie('sso_session_id', {
+      path: '/',
+      sameSite: 'lax',
+      secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
+    });
+
+    const redirectUri = req.query.redirect_uri || req.body.redirect_uri;
+    if (redirectUri) {
+      return res.redirect(redirectUri);
+    }
+    res.status(200).json({ success: true, message: 'Logged out from all systems.' });
+  };
+
+  if (!sessionId) {
+    return finishLogout();
   }
-  res.clearCookie('sso_session_id', {
-    path: '/',
-    sameSite: 'lax',
-    secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
+
+  db.get('SELECT email FROM sessions WHERE id = ?', [sessionId], (err, sessionRow) => {
+    if (err || !sessionRow) {
+      db.run('DELETE FROM sessions WHERE id = ?', [sessionId]);
+      return finishLogout();
+    }
+
+    const email = sessionRow.email;
+
+    db.all('SELECT client_id FROM session_clients WHERE sso_session_id = ?', [sessionId], async (clientsErr, clientRows) => {
+      if (clientsErr || !clientRows || clientRows.length === 0) {
+        db.run('DELETE FROM sessions WHERE id = ?', [sessionId]);
+        return finishLogout();
+      }
+
+      // Dispatch back-channel logout requests to all active clients
+      const logoutPromises = clientRows.map(row => {
+        return new Promise(async (resolve) => {
+          const logoutUrl = getAppLogoutUrl(row.client_id);
+          if (!logoutUrl) {
+            console.error(`Failed to resolve logout URL for client ${row.client_id}`);
+            return resolve();
+          }
+
+          if (!privateKeyPem) {
+            console.error('RSA private key not initialized; cannot sign logout token.');
+            return resolve();
+          }
+
+          try {
+            // Generate signed JWT logout token
+            const logoutTokenPayload = {
+              iss: 'kbs-auth',
+              sub: email,
+              aud: row.client_id,
+              iat: Math.floor(Date.now() / 1000),
+              exp: Math.floor(Date.now() / 1000) + 5 * 60, // 5 minutes validity
+              events: {
+                'http://schemas.openid.net/event/backchannel-logout': {}
+              }
+            };
+
+            const logoutToken = jwt.sign(logoutTokenPayload, privateKeyPem, { algorithm: 'RS256', keyid: 'sso-key-1' });
+
+            console.log(`Sending asymmetric back-channel logout to ${row.client_id} at ${logoutUrl}`);
+            const response = await fetch(logoutUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ logout_token: logoutToken })
+            });
+
+            if (!response.ok) {
+              console.warn(`Back-channel logout for ${row.client_id} returned status ${response.status}`);
+            }
+          } catch (postErr) {
+            console.error(`Error sending back-channel logout to ${row.client_id}:`, postErr.message);
+          }
+          resolve();
+        });
+      });
+
+      await Promise.all(logoutPromises);
+
+      db.run('DELETE FROM sessions WHERE id = ?', [sessionId], () => {
+        finishLogout();
+      });
+    });
   });
-
-  const redirectUri = req.query.redirect_uri || req.body.redirect_uri;
-  if (redirectUri) {
-    return res.redirect(redirectUri);
-  }
-
-  res.status(200).json({ success: true, message: 'Logged out from all systems.' });
 });
 
 // 7. Google OAuth Login redirection (supports client flow)
@@ -505,6 +654,8 @@ app.get('/api/auth/callback/google', async (req, res) => {
             });
 
             if (client_id && redirect_uri) {
+              db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
+
               createAuthCode(finalUserEmail, client_id, redirect_uri, (codeErr, code) => {
                 if (codeErr) return res.status(500).send('Auth code creation failed.');
                 const separator = redirect_uri.includes('?') ? '&' : '?';
