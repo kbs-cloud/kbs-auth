@@ -24,7 +24,14 @@ dist-ssr
 *.sw?
 
 # Database
-kbs_auth.db
+*.db
+*.db-*
+
+# Dependencies
+.vite
+
+# Walkthrough
+walkthrough.md
 
 # Commit & Changelog drafts
 NEXT_COMMIT.txt

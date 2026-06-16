@@ -32,6 +32,7 @@ body {
   color: var(--text-main);
   overflow-x: hidden;
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -319,4 +320,21 @@ body {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
+}
+
+/* Mobile responsive styles & iOS Safari fixes */
+@media (max-width: 480px) {
+  .auth-container {
+    padding: 2rem 1.25rem;
+  }
+  
+  .auth-header h1 {
+    font-size: 1.5rem;
+  }
+}
+
+@media (max-width: 767px) {
+  input, select, textarea {
+    font-size: 16px !important;
+  }
 }
