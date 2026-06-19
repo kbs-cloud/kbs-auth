@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react';
+import TermsOfService from './components/TermsOfService';
+import PrivacyPolicy from './components/PrivacyPolicy';
 
 export default function App() {
   const [isRegister, setIsRegister] = useState(false);
@@ -9,6 +11,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [user, setUser] = useState<any>(null);
+  const [showLegal, setShowLegal] = useState<'terms' | 'privacy' | 'none'>('none');
 
   // Password set/change states
   const [showPasswordForm, setShowPasswordForm] = useState(false);
@@ -42,6 +45,14 @@ export default function App() {
   useEffect(() => {
     // Check if user has an active SSO session
     checkSession();
+
+    // Check query parameters to open legal views directly (e.g. for Google OAuth verification)
+    const viewParam = params.get('view');
+    if (viewParam === 'privacy') {
+      setShowLegal('privacy');
+    } else if (viewParam === 'terms') {
+      setShowLegal('terms');
+    }
   }, []);
 
   const checkSession = async () => {
@@ -197,11 +208,23 @@ export default function App() {
       <div className="background-grid"></div>
       <div className="aurora"></div>
 
-      <div className="auth-container">
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: '20px',
+        zIndex: 10,
+        width: '100%',
+        maxWidth: '460px',
+        padding: '20px',
+        boxSizing: 'border-box'
+      }}>
+        <div className="auth-container" style={{ width: '100%', margin: 0 }}>
         {user ? (
           // Authenticated Dashboard
           <div>
             <div className="auth-header">
+              <img src="/logo.png" style={{ height: '64px', width: '64px', borderRadius: '8px', marginBottom: '12px', boxShadow: '0 0 15px rgba(0, 255, 255, 0.3)', objectFit: 'cover' }} alt="Logo" />
               <h1>SSO PORTAL</h1>
               <p>CONNECTION SECURE</p>
               <div className="client-badge">SSO USER: {user.display_name || user.email}</div>
@@ -317,6 +340,7 @@ export default function App() {
           // Login / Register Form
           <div>
             <div className="auth-header">
+              <img src="/logo.png" style={{ height: '64px', width: '64px', borderRadius: '8px', marginBottom: '12px', boxShadow: '0 0 15px rgba(0, 255, 255, 0.3)', objectFit: 'cover' }} alt="Logo" />
               <h1>KBS CLOUD</h1>
               <p>{clientInfo.subtitle || 'CENTRAL ACCESS POINT'}</p>
               {clientId && (
@@ -429,7 +453,71 @@ export default function App() {
             </div>
           </div>
         )}
+        </div>
+
+        {/* Legal links footer */}
+        <footer style={{
+          display: 'flex',
+          gap: '16px',
+          fontSize: '0.8rem',
+          fontFamily: 'var(--font-mono)',
+          color: 'var(--text-muted)'
+        }}>
+          <a
+            href="/?view=terms"
+            onClick={(e) => {
+              e.preventDefault();
+              setShowLegal('terms');
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              fontSize: '0.8rem',
+              fontFamily: 'var(--font-mono)',
+              transition: 'color 0.2s ease',
+              padding: 0,
+              textDecoration: 'none'
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.color = 'var(--color-secondary)'}
+            onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-muted)'}
+          >
+            Terms of Service
+          </a>
+          <span>|</span>
+          <a
+            href="/?view=privacy"
+            onClick={(e) => {
+              e.preventDefault();
+              setShowLegal('privacy');
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              fontSize: '0.8rem',
+              fontFamily: 'var(--font-mono)',
+              transition: 'color 0.2s ease',
+              padding: 0,
+              textDecoration: 'none'
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.color = 'var(--color-secondary)'}
+            onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-muted)'}
+          >
+            Privacy Policy
+          </a>
+        </footer>
       </div>
+
+      {/* Legal overlays */}
+      {showLegal === 'terms' && (
+        <TermsOfService onBack={() => setShowLegal('none')} />
+      )}
+      {showLegal === 'privacy' && (
+        <PrivacyPolicy onBack={() => setShowLegal('none')} />
+      )}
     </>
   );
 }
