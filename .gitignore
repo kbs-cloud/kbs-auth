@@ -43,3 +43,6 @@ deploy.sh
 # Environment variables
 .env
 .env.*
+
+# Build outputs
+out/
