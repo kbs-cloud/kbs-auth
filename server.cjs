@@ -152,7 +152,11 @@ app.use(cors({
 const getGoogleClient = (req) => {
   let callbackUrl = 'https://auth.kbs-cloud.com/api/auth/callback/google';
   
-  if (req) {
+  if (process.env.GOOGLE_CALLBACK_URL && !process.env.GOOGLE_CALLBACK_URL.includes('star-swarm') && !process.env.GOOGLE_CALLBACK_URL.includes('starswarm')) {
+    callbackUrl = process.env.GOOGLE_CALLBACK_URL;
+  } else if (process.env.NODE_ENV === 'production') {
+    callbackUrl = 'https://auth.kbs-cloud.com/api/auth/callback/google';
+  } else if (req) {
     const proto = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     if (proto === 'https') {
@@ -160,8 +164,6 @@ const getGoogleClient = (req) => {
     } else if (host) {
       callbackUrl = `http://${host}/api/auth/callback/google`;
     }
-  } else if (process.env.GOOGLE_CALLBACK_URL && !process.env.GOOGLE_CALLBACK_URL.includes('star-swarm') && !process.env.GOOGLE_CALLBACK_URL.includes('starswarm')) {
-    callbackUrl = process.env.GOOGLE_CALLBACK_URL;
   }
 
   return new OAuth2Client(
@@ -406,6 +408,27 @@ app.get('/api/auth/me', (req, res) => {
         displayName: user.display_name,
         isGoogleLinked: user.is_google_linked === 1,
         hasPassword: user.has_password === 1
+      }
+    });
+  });
+});
+
+// 5.0.1 Verify SSO Token
+app.post('/api/auth/verify', (req, res) => {
+  const { token } = req.body;
+  if (!token) {
+    return res.status(400).json({ success: false, error: 'Missing token.' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token.' });
+    }
+    res.status(200).json({
+      success: true,
+      user: {
+        email: decoded.email,
+        displayName: decoded.displayName
       }
     });
   });
