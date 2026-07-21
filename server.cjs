@@ -306,7 +306,7 @@ app.post('/api/auth/login', (req, res) => {
 
     if (!user.password_hash) {
       return res.status(400).json({
-        error: 'This account uses Google Sign-in. Please log in using Google.'
+        error: 'This account was created with Google Sign-in and does not have a password set yet. Click "Register Account" to set a password for this email.'
       });
     }
 
@@ -380,19 +380,40 @@ app.post('/api/auth/register', (req, res) => {
   const normalizedEmail = email.trim().toLowerCase();
   const passwordHash = bcrypt.hashSync(password, 10);
 
-  db.run(
-    'INSERT INTO users (email, password_hash, display_name, is_google_linked) VALUES (?, ?, ?, 0)',
-    [normalizedEmail, passwordHash, displayName || null],
-    function (err) {
-      if (err) {
-        if (err.message.includes('UNIQUE constraint failed')) {
-          return res.status(400).json({ error: 'An account with this email already exists.' });
-        }
-        return res.status(500).json({ error: 'Database registration error.' });
-      }
-      res.status(201).json({ success: true, message: 'Account registered successfully.' });
+  db.get('SELECT * FROM users WHERE email = ?', [normalizedEmail], (getErr, existingUser) => {
+    if (getErr) {
+      return res.status(500).json({ error: 'Database error checking account.' });
     }
-  );
+
+    if (existingUser) {
+      if (!existingUser.password_hash) {
+        // Account was created via Google Sign-In but has no password set yet -> set password!
+        db.run(
+          'UPDATE users SET password_hash = ?, display_name = COALESCE(display_name, ?) WHERE email = ?',
+          [passwordHash, displayName || null, normalizedEmail],
+          (updateErr) => {
+            if (updateErr) {
+              return res.status(500).json({ error: 'Failed to set account password.' });
+            }
+            res.status(200).json({ success: true, message: 'Password set successfully for your account! You can now log in.' });
+          }
+        );
+      } else {
+        return res.status(400).json({ error: 'An account with this email already exists.' });
+      }
+    } else {
+      db.run(
+        'INSERT INTO users (email, password_hash, display_name, is_google_linked) VALUES (?, ?, ?, 0)',
+        [normalizedEmail, passwordHash, displayName || null],
+        function (err) {
+          if (err) {
+            return res.status(500).json({ error: 'Database registration error.' });
+          }
+          res.status(201).json({ success: true, message: 'Account registered successfully.' });
+        }
+      );
+    }
+  });
 });
 
 // 5. Get current SSO User Details
