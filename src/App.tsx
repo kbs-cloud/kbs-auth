@@ -98,6 +98,12 @@ export default function App() {
         setTimeout(() => {
           window.location.href = data.redirectUri;
         }, 1200);
+      } else if (data.consentUrl) {
+        // Unregistered destination for this app -- send the user to the
+        // full-page consent screen instead of redirecting silently.
+        setTimeout(() => {
+          window.location.href = data.consentUrl;
+        }, 1200);
       } else {
         // Otherwise load current portal dashboard
         setUser(data.user);

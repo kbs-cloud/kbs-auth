@@ -14,6 +14,7 @@ const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const path = require('path');
+const fs = require('fs');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -209,6 +210,91 @@ function createAuthCode(email, clientId, redirectUri, callback) {
   );
 }
 
+// ---- Redirect-URI trust check ----
+// A game's officially registered URLs live in the Hub catalog (the same
+// database every game's register_game.cjs writes to), so we reuse that as
+// the allowlist instead of inventing a second registry. Any redirect_uri
+// whose origin isn't in that list (e.g. someone's self-hosted world reached
+// through a kbs-game-coordinator join code, on an arbitrary host/port) is
+// untrusted: we still let it work, but only after an explicit user-visible
+// consent screen naming the destination, instead of silently handing out a
+// login code to whatever origin the request claims.
+const HUB_DB_PATH = process.env.HUB_DB_PATH || '/servers/cloud/hub.db';
+let hubDb = null;
+try {
+  if (fs.existsSync(HUB_DB_PATH)) {
+    hubDb = new sqlite3.Database(HUB_DB_PATH, sqlite3.OPEN_READONLY, (err) => {
+      if (err) {
+        console.warn('[kbs-auth] Could not open Hub catalog for redirect_uri trust checks:', err.message);
+        hubDb = null;
+      }
+    });
+  } else {
+    console.warn('[kbs-auth] Hub catalog not found at', HUB_DB_PATH, '- all redirect_uris will require consent.');
+  }
+} catch (e) {
+  console.warn('[kbs-auth] Could not open Hub catalog:', e.message);
+}
+
+function originOf(urlString) {
+  try {
+    return new URL(urlString).origin;
+  } catch {
+    return null;
+  }
+}
+
+// Fails closed: any error, missing Hub db, or unregistered client_id means
+// "no known-good origins" rather than silently trusting the request.
+function isTrustedRedirect(clientId, redirectUri, callback) {
+  const requestedOrigin = originOf(redirectUri);
+  if (!requestedOrigin || !hubDb) return callback(false);
+  hubDb.get('SELECT dev_url, prod_url FROM apps WHERE id = ?', [clientId], (err, row) => {
+    if (err || !row) return callback(false);
+    const registered = [row.dev_url, row.prod_url].map(originOf).filter(Boolean);
+    callback(registered.includes(requestedOrigin));
+  });
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderConsentPage(res, { email, clientId, redirectUri }) {
+  const origin = originOf(redirectUri) || redirectUri;
+  res.status(200).send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Confirm sign-in - kbs-cloud</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #12160d; color: #ecf0f1; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { max-width: 480px; padding: 28px 32px; border: 2px solid rgba(230,126,34,0.6); border-radius: 12px; background: #1b232a; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .origin { color: #e67e22; font-weight: 700; word-break: break-all; }
+  p { line-height: 1.5; color: #cfd8dc; }
+  .actions { display: flex; gap: 10px; margin-top: 20px; }
+  button, a.cancel { flex: 1; text-align: center; padding: 10px 16px; border-radius: 7px; font-size: 15px; cursor: pointer; text-decoration: none; }
+  button { border: none; background: #e67e22; color: #12160d; font-weight: 700; }
+  a.cancel { border: 1px solid rgba(255,255,255,0.25); color: #ecf0f1; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>Confirm sign-in</h1>
+    <p><strong>${escapeHtml(origin)}</strong> is asking to sign you in as <strong>${escapeHtml(email)}</strong>
+      using your kbs-cloud account (app id "${escapeHtml(clientId)}").</p>
+    <p>This is <span class="origin">not a registered kbs-cloud deployment</span> for this app -
+      it may be someone's self-hosted server. Only continue if you trust it (for example,
+      a friend invited you to their world).</p>
+    <div class="actions">
+      <a class="cancel" href="/">Cancel</a>
+      <form method="POST" action="/api/auth/authorize/confirm" style="flex:1;margin:0;">
+        <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+        <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+        <button type="submit" style="width:100%;">Continue</button>
+      </form>
+    </div>
+  </div>
+</body></html>`);
+}
+
 // 1. Authorize Endpoint (Standard SSO Entrypoint)
 app.get('/api/auth/authorize', (req, res) => {
   const { client_id, redirect_uri } = req.query;
@@ -230,7 +316,38 @@ app.get('/api/auth/authorize', (req, res) => {
       db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
     }
 
-    // Already logged in! Generate authorization code and redirect back instantly
+    isTrustedRedirect(client_id, redirect_uri, (trusted) => {
+      if (!trusted) {
+        return renderConsentPage(res, { email: user.email, clientId: client_id, redirectUri: redirect_uri });
+      }
+      // Already logged in and this is a registered destination for this app!
+      // Generate authorization code and redirect back instantly.
+      createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
+        if (codeErr) {
+          return res.status(500).send('Internal database error creating login code.');
+        }
+        const separator = redirect_uri.includes('?') ? '&' : '?';
+        res.redirect(`${redirect_uri}${separator}code=${code}`);
+      });
+    });
+  });
+});
+
+// Confirms an untrusted (unregistered) redirect_uri that the user has
+// explicitly agreed to on the consent page above, and issues the code.
+app.post('/api/auth/authorize/confirm', (req, res) => {
+  const { client_id, redirect_uri } = req.body || {};
+  if (!client_id || !redirect_uri) {
+    return res.status(400).send('Missing client_id or redirect_uri parameters.');
+  }
+  getSSOSessionUser(req, (err, user) => {
+    if (err || !user) {
+      return res.redirect(`/?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`);
+    }
+    const sessionId = req.cookies['sso_session_id'];
+    if (sessionId) {
+      db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
+    }
     createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
       if (codeErr) {
         return res.status(500).send('Internal database error creating login code.');
@@ -350,13 +467,24 @@ app.post('/api/auth/login', (req, res) => {
         if (client_id && redirect_uri) {
           db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
 
-          createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
-            if (codeErr) {
-              return res.status(500).json({ error: 'Failed to create login redirect code.' });
+          isTrustedRedirect(client_id, redirect_uri, (trusted) => {
+            if (!trusted) {
+              // Unregistered destination -- the SPA must navigate to a
+              // full-page consent screen (naming the destination) rather
+              // than being handed a code to redirect to silently. The
+              // freshly-set session cookie makes this a GET back through
+              // /api/auth/authorize, which renders the same consent page.
+              responseData.consentUrl = `/api/auth/authorize?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
+              return res.status(200).json(responseData);
             }
-            const separator = redirect_uri.includes('?') ? '&' : '?';
-            responseData.redirectUri = `${redirect_uri}${separator}code=${code}`;
-            res.status(200).json(responseData);
+            createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
+              if (codeErr) {
+                return res.status(500).json({ error: 'Failed to create login redirect code.' });
+              }
+              const separator = redirect_uri.includes('?') ? '&' : '?';
+              responseData.redirectUri = `${redirect_uri}${separator}code=${code}`;
+              res.status(200).json(responseData);
+            });
           });
         } else {
           res.status(200).json(responseData);
@@ -509,7 +637,8 @@ function getAppLogoutUrl(clientId) {
     'starswarm': 2,
     'tickerclash': 3,
     'alchemist': 4,
-    'gridlock-neon': 5
+    'gridlock-neon': 5,
+    'wyrdmarch': 9
   };
 
   const offset = clientConfigMap[clientId];
@@ -700,10 +829,15 @@ app.get('/api/auth/callback/google', async (req, res) => {
             if (client_id && redirect_uri) {
               db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
 
-              createAuthCode(finalUserEmail, client_id, redirect_uri, (codeErr, code) => {
-                if (codeErr) return res.status(500).send('Auth code creation failed.');
-                const separator = redirect_uri.includes('?') ? '&' : '?';
-                res.redirect(`${redirect_uri}${separator}code=${code}`);
+              isTrustedRedirect(client_id, redirect_uri, (trusted) => {
+                if (!trusted) {
+                  return renderConsentPage(res, { email: finalUserEmail, clientId: client_id, redirectUri: redirect_uri });
+                }
+                createAuthCode(finalUserEmail, client_id, redirect_uri, (codeErr, code) => {
+                  if (codeErr) return res.status(500).send('Auth code creation failed.');
+                  const separator = redirect_uri.includes('?') ? '&' : '?';
+                  res.redirect(`${redirect_uri}${separator}code=${code}`);
+                });
               });
             } else {
               res.redirect('/');
@@ -736,10 +870,110 @@ app.get('/api/auth/callback/google', async (req, res) => {
   }
 });
 
+// Helper to render custom 404 HTML page for missing resources
+function send404Page(req, res) {
+  res.status(404).send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>404 - Page Not Found | KBS Auth</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background-color: #0b0f19;
+      color: #f3f4f6;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 16px;
+      padding: 48px 36px;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+    }
+    .badge {
+      display: inline-block;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #818cf8;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      padding: 4px 12px;
+      border-radius: 9999px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 800;
+      color: #ffffff;
+      margin-bottom: 12px;
+    }
+    p {
+      color: #9ca3af;
+      font-size: 15px;
+      line-height: 1.6;
+      margin-bottom: 28px;
+    }
+    code {
+      background: #1f2937;
+      color: #f43f5e;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 14px;
+      font-family: monospace;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+      color: #ffffff;
+      font-weight: 600;
+      font-size: 15px;
+      padding: 12px 24px;
+      border-radius: 10px;
+      text-decoration: none;
+      box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.4);
+      transition: all 0.2s ease;
+    }
+    .btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.6);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">404 Error</div>
+    <h1>Page Not Found</h1>
+    <p>The page <code>${req.path}</code> is no longer hosted or has been moved.</p>
+    <a href="/" class="btn">Return to Homepage</a>
+  </div>
+</body>
+</html>`);
+}
+
 // Serves the client SPA files in production
 app.use(express.static(path.join(__dirname, 'dist')));
 app.get('*splat', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  if (req.path === '/' || req.path === '/index.html') {
+    return res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  }
+  if (req.path.startsWith('/api')) {
+    return res.status(404).json({ error: 'Not Found' });
+  }
+  send404Page(req, res);
 });
 
 app.listen(PORT, () => {
@@ -773,7 +1007,10 @@ if (process.env.FRONTEND_PORT && String(process.env.FRONTEND_PORT) !== String(PO
 
   frontendApp.use(express.static(path.join(__dirname, 'dist')));
   frontendApp.get('*splat', (req, res) => {
-    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    if (req.path === '/' || req.path === '/index.html') {
+      return res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    }
+    send404Page(req, res);
   });
   frontendApp.listen(process.env.FRONTEND_PORT, () => {
     console.log(`KBS-Auth static frontend server running on port ${process.env.FRONTEND_PORT}`);
