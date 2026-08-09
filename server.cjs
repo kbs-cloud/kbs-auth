@@ -49,8 +49,43 @@ try {
   console.error('Failed to generate RSA key pair:', keyErr.message);
 }
 
-// Database Connection
-const dbPath = path.join(__dirname, 'kbs_auth.db');
+// ---- SSO master session lifetime ----
+//
+// The session slides: every request that reads it past the halfway point pushes
+// it back to a full term, so this is how long someone may stay *away* before
+// signing in again, not how long they may stay signed in. A fixed 24-hour term
+// was signing people out mid-use, which is not what any consumer site does.
+//
+// Sliding is the whole point, so the term itself can stay modest: an
+// unattended browser still lapses within the month.
+const SSO_SESSION_TTL_MS = Number(process.env.KBS_AUTH_SESSION_TTL_MS) > 0
+  ? Number(process.env.KBS_AUTH_SESSION_TTL_MS)
+  : 30 * 24 * 60 * 60 * 1000;
+
+/** Attributes every `sso_session_id` cookie must share, whether set or cleared. */
+function ssoCookieOptions(req) {
+  return {
+    httpOnly: true,
+    path: '/',
+    sameSite: 'lax',
+    secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
+  };
+}
+
+/**
+ * Issues or re-issues the session cookie.
+ *
+ * Renewal has to repeat every attribute of the original: a cookie that differed
+ * in path or sameSite would sit alongside the first rather than replace it, and
+ * the browser would go on sending the stale one.
+ */
+function setSSOSessionCookie(req, res, sessionId) {
+  res.cookie('sso_session_id', sessionId, { ...ssoCookieOptions(req), maxAge: SSO_SESSION_TTL_MS });
+}
+
+// Database Connection. Overridable so a test run cannot open the live account
+// database by accident, which is otherwise the only database this file knows.
+const dbPath = process.env.KBS_AUTH_DB_PATH || path.join(__dirname, 'kbs_auth.db');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Failed to connect to SQLite database:', err.message);
@@ -174,23 +209,50 @@ const getGoogleClient = (req) => {
   );
 };
 
-// Helper: validate SSO session
-function getSSOSessionUser(req, callback) {
+/**
+ * Validates the SSO session, and renews it while it is being used.
+ *
+ * Every authenticated path in this service goes through here, which is exactly
+ * why the renewal belongs here: a session is "in use" whenever something asked
+ * about it, and no route has to remember to say so.
+ *
+ * Renewing only past the halfway point keeps this to one write per half-term
+ * rather than one per request. `res` is optional so a caller with nothing to
+ * write back — there are none today, but the shape invites one — still reads
+ * correctly; the row is extended either way, only the cookie is skipped.
+ */
+function getSSOSessionUser(req, res, callback) {
+  if (typeof res === 'function') {
+    callback = res;
+    res = null;
+  }
+
   const sessionId = req.cookies['sso_session_id'];
   if (!sessionId) {
     return callback(null, null);
   }
-  const now = new Date().toISOString();
+  const now = Date.now();
   db.get(
-    `SELECT u.email, u.display_name, u.is_google_linked, (u.password_hash IS NOT NULL) AS has_password 
-     FROM sessions s 
-     JOIN users u ON s.email = u.email 
+    `SELECT u.email, u.display_name, u.is_google_linked, (u.password_hash IS NOT NULL) AS has_password,
+            s.expires_at
+     FROM sessions s
+     JOIN users u ON s.email = u.email
      WHERE s.id = ? AND s.expires_at > ?`,
-    [sessionId, now],
+    [sessionId, new Date(now).toISOString()],
     (err, row) => {
       if (err || !row) {
         return callback(null, null);
       }
+
+      const expiresAt = new Date(row.expires_at).getTime();
+      if (Number.isFinite(expiresAt) && now >= expiresAt - SSO_SESSION_TTL_MS / 2) {
+        const renewed = new Date(now + SSO_SESSION_TTL_MS).toISOString();
+        db.run('UPDATE sessions SET expires_at = ? WHERE id = ?', [renewed, sessionId]);
+        if (res) {
+          setSSOSessionCookie(req, res, sessionId);
+        }
+      }
+
       callback(null, row);
     }
   );
@@ -303,7 +365,7 @@ app.get('/api/auth/authorize', (req, res) => {
     return res.status(400).send('Missing client_id or redirect_uri parameters.');
   }
 
-  getSSOSessionUser(req, (err, user) => {
+  getSSOSessionUser(req, res, (err, user) => {
     if (err || !user) {
       // Not logged in. Redirect to SSO Portal Login screen with redirect context
       const loginUrl = `/?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
@@ -340,7 +402,7 @@ app.post('/api/auth/authorize/confirm', (req, res) => {
   if (!client_id || !redirect_uri) {
     return res.status(400).send('Missing client_id or redirect_uri parameters.');
   }
-  getSSOSessionUser(req, (err, user) => {
+  getSSOSessionUser(req, res, (err, user) => {
     if (err || !user) {
       return res.redirect(`/?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`);
     }
@@ -434,7 +496,7 @@ app.post('/api/auth/login', (req, res) => {
 
     // Initialize SSO master session
     const sessionId = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours SSO session
+    const expiresAt = new Date(Date.now() + SSO_SESSION_TTL_MS).toISOString();
 
     db.run(
       'INSERT INTO sessions (id, email, expires_at) VALUES (?, ?, ?)',
@@ -445,13 +507,7 @@ app.post('/api/auth/login', (req, res) => {
         }
 
         // Set HttpOnly Cookie scoped for SSO domain
-        res.cookie('sso_session_id', sessionId, {
-          httpOnly: true,
-          path: '/',
-          sameSite: 'lax',
-          secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
-          maxAge: 24 * 60 * 60 * 1000 // 24 hours
-        });
+        setSSOSessionCookie(req, res, sessionId);
 
         const responseData = {
           success: true,
@@ -546,7 +602,7 @@ app.post('/api/auth/register', (req, res) => {
 
 // 5. Get current SSO User Details
 app.get('/api/auth/me', (req, res) => {
-  getSSOSessionUser(req, (err, user) => {
+  getSSOSessionUser(req, res, (err, user) => {
     if (err || !user) {
       return res.status(401).json({ error: 'Unauthorized. No active SSO session.' });
     }
@@ -585,7 +641,7 @@ app.post('/api/auth/verify', (req, res) => {
 
 // 5.1 Change/Set Password
 app.post('/api/auth/change-password', (req, res) => {
-  getSSOSessionUser(req, (err, sessionUser) => {
+  getSSOSessionUser(req, res, (err, sessionUser) => {
     if (err || !sessionUser) {
       return res.status(401).json({ error: 'Unauthorized. No active SSO session.' });
     }
@@ -662,11 +718,7 @@ app.all('/api/auth/logout', (req, res) => {
   const sessionId = req.cookies['sso_session_id'];
 
   const finishLogout = () => {
-    res.clearCookie('sso_session_id', {
-      path: '/',
-      sameSite: 'lax',
-      secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
-    });
+    res.clearCookie('sso_session_id', ssoCookieOptions(req));
 
     const redirectUri = req.query.redirect_uri || req.body.redirect_uri;
     if (redirectUri) {
@@ -808,7 +860,7 @@ app.get('/api/auth/callback/google', async (req, res) => {
     db.get('SELECT * FROM users WHERE email = ?', [email], (err, user) => {
       const handleSessionCreation = (finalUserEmail, finalDisplayName) => {
         const sessionId = crypto.randomBytes(32).toString('hex');
-        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const expiresAt = new Date(Date.now() + SSO_SESSION_TTL_MS).toISOString();
 
         db.run(
           'INSERT INTO sessions (id, email, expires_at) VALUES (?, ?, ?)',
@@ -818,13 +870,7 @@ app.get('/api/auth/callback/google', async (req, res) => {
               return res.status(500).send('Session creation failed.');
             }
 
-            res.cookie('sso_session_id', sessionId, {
-              httpOnly: true,
-              path: '/',
-              sameSite: 'lax',
-              secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
-              maxAge: 24 * 60 * 60 * 1000
-            });
+            setSSOSessionCookie(req, res, sessionId);
 
             if (client_id && redirect_uri) {
               db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
