@@ -297,7 +297,7 @@ function renderConsentPage(res, { email, clientId, redirectUri }) {
 
 // 1. Authorize Endpoint (Standard SSO Entrypoint)
 app.get('/api/auth/authorize', (req, res) => {
-  const { client_id, redirect_uri } = req.query;
+  const { client_id, redirect_uri, prompt } = req.query;
 
   if (!client_id || !redirect_uri) {
     return res.status(400).send('Missing client_id or redirect_uri parameters.');
@@ -305,6 +305,10 @@ app.get('/api/auth/authorize', (req, res) => {
 
   getSSOSessionUser(req, (err, user) => {
     if (err || !user) {
+      if (prompt === 'none') {
+        const separator = redirect_uri.includes('?') ? '&' : '?';
+        return res.redirect(`${redirect_uri}${separator}error=login_required`);
+      }
       // Not logged in. Redirect to SSO Portal Login screen with redirect context
       const loginUrl = `/?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
       return res.redirect(loginUrl);
