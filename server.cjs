@@ -49,8 +49,43 @@ try {
   console.error('Failed to generate RSA key pair:', keyErr.message);
 }
 
-// Database Connection
-const dbPath = path.join(__dirname, 'kbs_auth.db');
+// ---- SSO master session lifetime ----
+//
+// The session slides: every request that reads it past the halfway point pushes
+// it back to a full term, so this is how long someone may stay *away* before
+// signing in again, not how long they may stay signed in. A fixed 24-hour term
+// was signing people out mid-use, which is not what any consumer site does.
+//
+// Sliding is the whole point, so the term itself can stay modest: an
+// unattended browser still lapses within the month.
+const SSO_SESSION_TTL_MS = Number(process.env.KBS_AUTH_SESSION_TTL_MS) > 0
+  ? Number(process.env.KBS_AUTH_SESSION_TTL_MS)
+  : 30 * 24 * 60 * 60 * 1000;
+
+/** Attributes every `sso_session_id` cookie must share, whether set or cleared. */
+function ssoCookieOptions(req) {
+  return {
+    httpOnly: true,
+    path: '/',
+    sameSite: 'lax',
+    secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
+  };
+}
+
+/**
+ * Issues or re-issues the session cookie.
+ *
+ * Renewal has to repeat every attribute of the original: a cookie that differed
+ * in path or sameSite would sit alongside the first rather than replace it, and
+ * the browser would go on sending the stale one.
+ */
+function setSSOSessionCookie(req, res, sessionId) {
+  res.cookie('sso_session_id', sessionId, { ...ssoCookieOptions(req), maxAge: SSO_SESSION_TTL_MS });
+}
+
+// Database Connection. Overridable so a test run cannot open the live account
+// database by accident, which is otherwise the only database this file knows.
+const dbPath = process.env.KBS_AUTH_DB_PATH || path.join(__dirname, 'kbs_auth.db');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Failed to connect to SQLite database:', err.message);
@@ -106,6 +141,21 @@ function initializeTables() {
         expires_at DATETIME
       )
     `);
+
+    // Per-app Google OAuth tokens (for apps requesting extra Google API scopes)
+    db.run(`
+      CREATE TABLE IF NOT EXISTS google_tokens (
+        email TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        expires_at_unix INTEGER NOT NULL,
+        scope TEXT NOT NULL,
+        session_token TEXT NOT NULL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (email, client_id)
+      )
+    `);
   });
 }
 
@@ -139,7 +189,9 @@ app.use(cors({
       'https://auth.kbs-cloud.com', 'http://auth.kbs-cloud.com',
       'https://starswarm.kbs-cloud.com', 'http://starswarm.kbs-cloud.com',
       'https://tickerclash.kbs-cloud.com', 'http://tickerclash.kbs-cloud.com',
-      'https://ticker-clash.kbs-cloud.com', 'http://ticker-clash.kbs-cloud.com'
+      'https://ticker-clash.kbs-cloud.com', 'http://ticker-clash.kbs-cloud.com',
+      'https://hifigemini.kbs-cloud.com', 'http://hifigemini.kbs-cloud.com',
+      'http://127.0.0.1:13015', 'http://localhost:13015'
     ];
     if (allowed.indexOf(origin) !== -1 || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
       return callback(null, true);
@@ -174,23 +226,50 @@ const getGoogleClient = (req) => {
   );
 };
 
-// Helper: validate SSO session
-function getSSOSessionUser(req, callback) {
+/**
+ * Validates the SSO session, and renews it while it is being used.
+ *
+ * Every authenticated path in this service goes through here, which is exactly
+ * why the renewal belongs here: a session is "in use" whenever something asked
+ * about it, and no route has to remember to say so.
+ *
+ * Renewing only past the halfway point keeps this to one write per half-term
+ * rather than one per request. `res` is optional so a caller with nothing to
+ * write back — there are none today, but the shape invites one — still reads
+ * correctly; the row is extended either way, only the cookie is skipped.
+ */
+function getSSOSessionUser(req, res, callback) {
+  if (typeof res === 'function') {
+    callback = res;
+    res = null;
+  }
+
   const sessionId = req.cookies['sso_session_id'];
   if (!sessionId) {
     return callback(null, null);
   }
-  const now = new Date().toISOString();
+  const now = Date.now();
   db.get(
-    `SELECT u.email, u.display_name, u.is_google_linked, (u.password_hash IS NOT NULL) AS has_password 
-     FROM sessions s 
-     JOIN users u ON s.email = u.email 
+    `SELECT u.email, u.display_name, u.is_google_linked, (u.password_hash IS NOT NULL) AS has_password,
+            s.expires_at
+     FROM sessions s
+     JOIN users u ON s.email = u.email
      WHERE s.id = ? AND s.expires_at > ?`,
-    [sessionId, now],
+    [sessionId, new Date(now).toISOString()],
     (err, row) => {
       if (err || !row) {
         return callback(null, null);
       }
+
+      const expiresAt = new Date(row.expires_at).getTime();
+      if (Number.isFinite(expiresAt) && now >= expiresAt - SSO_SESSION_TTL_MS / 2) {
+        const renewed = new Date(now + SSO_SESSION_TTL_MS).toISOString();
+        db.run('UPDATE sessions SET expires_at = ? WHERE id = ?', [renewed, sessionId]);
+        if (res) {
+          setSSOSessionCookie(req, res, sessionId);
+        }
+      }
+
       callback(null, row);
     }
   );
@@ -244,6 +323,93 @@ function originOf(urlString) {
   }
 }
 
+function parseScopeList(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function normalizeScopeForCompare(scope) {
+  if (scope === 'email') return 'https://www.googleapis.com/auth/userinfo.email';
+  if (scope === 'profile') return 'https://www.googleapis.com/auth/userinfo.profile';
+  return scope;
+}
+
+function getAppGoogleScopes(clientId, callback) {
+  if (!clientId || !hubDb) {
+    return callback([]);
+  }
+  hubDb.get('SELECT google_scopes FROM apps WHERE id = ?', [clientId], (err, row) => {
+    if (err || !row || !row.google_scopes) {
+      return callback([]);
+    }
+    callback(parseScopeList(row.google_scopes));
+  });
+}
+
+function hasValidGoogleTokens(email, clientId, extraScopes, callback) {
+  if (!extraScopes || extraScopes.length === 0) {
+    return callback(null, true);
+  }
+  db.get(
+    'SELECT scope, refresh_token FROM google_tokens WHERE email = ? AND client_id = ?',
+    [email, clientId],
+    (err, row) => {
+      if (err) return callback(err, false);
+      if (!row || !row.refresh_token || !String(row.refresh_token).trim()) {
+        return callback(null, false);
+      }
+      const granted = new Set(parseScopeList(row.scope).map(normalizeScopeForCompare));
+      const satisfied = extraScopes.every((s) => granted.has(normalizeScopeForCompare(s)));
+      callback(null, satisfied);
+    }
+  );
+}
+
+function saveAppGoogleTokens(email, clientId, tokens, extraScopes, callback) {
+  if (!clientId || !extraScopes || extraScopes.length === 0 || !tokens || !tokens.access_token) {
+    return callback(null);
+  }
+  const expiresAtUnix = tokens.expiry_date
+    ? Math.floor(tokens.expiry_date / 1000)
+    : Math.floor(Date.now() / 1000) + 3600;
+  const grantedScope = tokens.scope || Array.from(new Set([
+    'https://www.googleapis.com/auth/userinfo.email',
+    'profile',
+    ...extraScopes
+  ])).join(' ');
+  const refreshToken = tokens.refresh_token ? String(tokens.refresh_token) : null;
+  const sessionToken = crypto.randomBytes(32).toString('hex');
+
+  db.run(
+    `INSERT INTO google_tokens (
+       email, client_id, access_token, refresh_token, expires_at_unix, scope, session_token, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(email, client_id) DO UPDATE SET
+       access_token = excluded.access_token,
+       refresh_token = COALESCE(NULLIF(excluded.refresh_token, ''), google_tokens.refresh_token),
+       expires_at_unix = excluded.expires_at_unix,
+       scope = excluded.scope,
+       session_token = excluded.session_token,
+       updated_at = CURRENT_TIMESTAMP`,
+    [email, clientId, tokens.access_token, refreshToken, expiresAtUnix, grantedScope, sessionToken],
+    (err) => callback(err)
+  );
+}
+
+function isLoopbackHttpOrigin(urlString) {
+  try {
+    const u = new URL(urlString);
+    return u.protocol === 'http:' &&
+      (u.hostname === '127.0.0.1' || u.hostname === 'localhost') &&
+      Boolean(u.port);
+  } catch {
+    return false;
+  }
+}
+
 // Fails closed: any error, missing Hub db, or unregistered client_id means
 // "no known-good origins" rather than silently trusting the request.
 function isTrustedRedirect(clientId, redirectUri, callback) {
@@ -252,7 +418,10 @@ function isTrustedRedirect(clientId, redirectUri, callback) {
   hubDb.get('SELECT dev_url, prod_url FROM apps WHERE id = ?', [clientId], (err, row) => {
     if (err || !row) return callback(false);
     const registered = [row.dev_url, row.prod_url].map(originOf).filter(Boolean);
-    callback(registered.includes(requestedOrigin));
+    if (registered.includes(requestedOrigin)) {
+      return callback(true);
+    }
+    callback(isLoopbackHttpOrigin(redirectUri));
   });
 }
 
@@ -303,7 +472,7 @@ app.get('/api/auth/authorize', (req, res) => {
     return res.status(400).send('Missing client_id or redirect_uri parameters.');
   }
 
-  getSSOSessionUser(req, (err, user) => {
+  getSSOSessionUser(req, res, (err, user) => {
     if (err || !user) {
       if (prompt === 'none') {
         const separator = redirect_uri.includes('?') ? '&' : '?';
@@ -320,18 +489,37 @@ app.get('/api/auth/authorize', (req, res) => {
       db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
     }
 
-    isTrustedRedirect(client_id, redirect_uri, (trusted) => {
-      if (!trusted) {
-        return renderConsentPage(res, { email: user.email, clientId: client_id, redirectUri: redirect_uri });
-      }
-      // Already logged in and this is a registered destination for this app!
-      // Generate authorization code and redirect back instantly.
-      createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
-        if (codeErr) {
-          return res.status(500).send('Internal database error creating login code.');
+    getAppGoogleScopes(client_id, (extraScopes) => {
+      hasValidGoogleTokens(user.email, client_id, extraScopes, (tokenErr, tokensOk) => {
+        if (tokenErr) {
+          return res.status(500).send('Internal database error checking Google authorization.');
         }
-        const separator = redirect_uri.includes('?') ? '&' : '?';
-        res.redirect(`${redirect_uri}${separator}code=${code}`);
+        if (extraScopes.length > 0 && !tokensOk) {
+          if (prompt === 'none') {
+            const separator = redirect_uri.includes('?') ? '&' : '?';
+            return res.redirect(`${redirect_uri}${separator}error=consent_required`);
+          }
+          return res.redirect(`/api/auth/google?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`);
+        }
+
+        isTrustedRedirect(client_id, redirect_uri, (trusted) => {
+          if (!trusted) {
+            if (prompt === 'none') {
+              const separator = redirect_uri.includes('?') ? '&' : '?';
+              return res.redirect(`${redirect_uri}${separator}error=consent_required`);
+            }
+            return renderConsentPage(res, { email: user.email, clientId: client_id, redirectUri: redirect_uri });
+          }
+          // Already logged in and this is a registered destination for this app!
+          // Generate authorization code and redirect back instantly.
+          createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
+            if (codeErr) {
+              return res.status(500).send('Internal database error creating login code.');
+            }
+            const separator = redirect_uri.includes('?') ? '&' : '?';
+            res.redirect(`${redirect_uri}${separator}code=${code}`);
+          });
+        });
       });
     });
   });
@@ -344,7 +532,7 @@ app.post('/api/auth/authorize/confirm', (req, res) => {
   if (!client_id || !redirect_uri) {
     return res.status(400).send('Missing client_id or redirect_uri parameters.');
   }
-  getSSOSessionUser(req, (err, user) => {
+  getSSOSessionUser(req, res, (err, user) => {
     if (err || !user) {
       return res.redirect(`/?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`);
     }
@@ -400,11 +588,29 @@ app.post('/api/auth/token', (req, res) => {
 
         const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1h' });
 
-        res.status(200).json({
-          success: true,
-          token,
-          user: tokenPayload
-        });
+        db.get(
+          'SELECT access_token, expires_at_unix, scope, session_token, refresh_token FROM google_tokens WHERE email = ? AND client_id = ?',
+          [user.email, authCodeRow.client_id],
+          (gtErr, gt) => {
+            const responseBody = {
+              success: true,
+              token,
+              user: tokenPayload
+            };
+            if (gtErr) {
+              console.error('Failed to read google_tokens during token exchange:', gtErr);
+            } else if (gt) {
+              responseBody.googleAuth = {
+                accessToken: gt.access_token,
+                expiresAtUnix: gt.expires_at_unix,
+                scope: gt.scope,
+                sessionToken: gt.session_token,
+                hasRefreshToken: Boolean(gt.refresh_token)
+              };
+            }
+            res.status(200).json(responseBody);
+          }
+        );
       });
     }
   );
@@ -438,7 +644,7 @@ app.post('/api/auth/login', (req, res) => {
 
     // Initialize SSO master session
     const sessionId = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours SSO session
+    const expiresAt = new Date(Date.now() + SSO_SESSION_TTL_MS).toISOString();
 
     db.run(
       'INSERT INTO sessions (id, email, expires_at) VALUES (?, ?, ?)',
@@ -449,13 +655,7 @@ app.post('/api/auth/login', (req, res) => {
         }
 
         // Set HttpOnly Cookie scoped for SSO domain
-        res.cookie('sso_session_id', sessionId, {
-          httpOnly: true,
-          path: '/',
-          sameSite: 'lax',
-          secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
-          maxAge: 24 * 60 * 60 * 1000 // 24 hours
-        });
+        setSSOSessionCookie(req, res, sessionId);
 
         const responseData = {
           success: true,
@@ -471,23 +671,34 @@ app.post('/api/auth/login', (req, res) => {
         if (client_id && redirect_uri) {
           db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
 
-          isTrustedRedirect(client_id, redirect_uri, (trusted) => {
-            if (!trusted) {
-              // Unregistered destination -- the SPA must navigate to a
-              // full-page consent screen (naming the destination) rather
-              // than being handed a code to redirect to silently. The
-              // freshly-set session cookie makes this a GET back through
-              // /api/auth/authorize, which renders the same consent page.
-              responseData.consentUrl = `/api/auth/authorize?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
-              return res.status(200).json(responseData);
-            }
-            createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
-              if (codeErr) {
-                return res.status(500).json({ error: 'Failed to create login redirect code.' });
+          getAppGoogleScopes(client_id, (extraScopes) => {
+            hasValidGoogleTokens(user.email, client_id, extraScopes, (tokenErr, tokensOk) => {
+              if (tokenErr) {
+                return res.status(500).json({ error: 'Failed to verify Google authorization status.' });
               }
-              const separator = redirect_uri.includes('?') ? '&' : '?';
-              responseData.redirectUri = `${redirect_uri}${separator}code=${code}`;
-              res.status(200).json(responseData);
+              if (extraScopes.length > 0 && !tokensOk) {
+                responseData.consentUrl = `/api/auth/authorize?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
+                return res.status(200).json(responseData);
+              }
+              isTrustedRedirect(client_id, redirect_uri, (trusted) => {
+                if (!trusted) {
+                  // Unregistered destination -- the SPA must navigate to a
+                  // full-page consent screen (naming the destination) rather
+                  // than being handed a code to redirect to silently. The
+                  // freshly-set session cookie makes this a GET back through
+                  // /api/auth/authorize, which renders the same consent page.
+                  responseData.consentUrl = `/api/auth/authorize?client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
+                  return res.status(200).json(responseData);
+                }
+                createAuthCode(user.email, client_id, redirect_uri, (codeErr, code) => {
+                  if (codeErr) {
+                    return res.status(500).json({ error: 'Failed to create login redirect code.' });
+                  }
+                  const separator = redirect_uri.includes('?') ? '&' : '?';
+                  responseData.redirectUri = `${redirect_uri}${separator}code=${code}`;
+                  res.status(200).json(responseData);
+                });
+              });
             });
           });
         } else {
@@ -550,7 +761,7 @@ app.post('/api/auth/register', (req, res) => {
 
 // 5. Get current SSO User Details
 app.get('/api/auth/me', (req, res) => {
-  getSSOSessionUser(req, (err, user) => {
+  getSSOSessionUser(req, res, (err, user) => {
     if (err || !user) {
       return res.status(401).json({ error: 'Unauthorized. No active SSO session.' });
     }
@@ -589,7 +800,7 @@ app.post('/api/auth/verify', (req, res) => {
 
 // 5.1 Change/Set Password
 app.post('/api/auth/change-password', (req, res) => {
-  getSSOSessionUser(req, (err, sessionUser) => {
+  getSSOSessionUser(req, res, (err, sessionUser) => {
     if (err || !sessionUser) {
       return res.status(401).json({ error: 'Unauthorized. No active SSO session.' });
     }
@@ -666,11 +877,7 @@ app.all('/api/auth/logout', (req, res) => {
   const sessionId = req.cookies['sso_session_id'];
 
   const finishLogout = () => {
-    res.clearCookie('sso_session_id', {
-      path: '/',
-      sameSite: 'lax',
-      secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
-    });
+    res.clearCookie('sso_session_id', ssoCookieOptions(req));
 
     const redirectUri = req.query.redirect_uri || req.body.redirect_uri;
     if (redirectUri) {
@@ -762,13 +969,26 @@ app.get('/api/auth/google', (req, res) => {
   const stateObj = { client_id, redirect_uri };
   const stateStr = Buffer.from(JSON.stringify(stateObj)).toString('base64');
 
-  const client = getGoogleClient(req);
-  const url = client.generateAuthUrl({
-    access_type: 'offline',
-    scope: ['https://www.googleapis.com/auth/userinfo.email', 'profile'],
-    state: stateStr
+  getAppGoogleScopes(client_id, (extraScopes) => {
+    const scope = Array.from(new Set([
+      'https://www.googleapis.com/auth/userinfo.email',
+      'profile',
+      ...extraScopes
+    ]));
+    const authUrlOptions = {
+      access_type: 'offline',
+      scope,
+      state: stateStr
+    };
+    if (extraScopes.length > 0) {
+      authUrlOptions.include_granted_scopes = true;
+      authUrlOptions.prompt = 'consent';
+    }
+
+    const client = getGoogleClient(req);
+    const url = client.generateAuthUrl(authUrlOptions);
+    res.redirect(url);
   });
-  res.redirect(url);
 });
 
 // 8. Google OAuth Callback
@@ -812,7 +1032,7 @@ app.get('/api/auth/callback/google', async (req, res) => {
     db.get('SELECT * FROM users WHERE email = ?', [email], (err, user) => {
       const handleSessionCreation = (finalUserEmail, finalDisplayName) => {
         const sessionId = crypto.randomBytes(32).toString('hex');
-        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const expiresAt = new Date(Date.now() + SSO_SESSION_TTL_MS).toISOString();
 
         db.run(
           'INSERT INTO sessions (id, email, expires_at) VALUES (?, ?, ?)',
@@ -822,30 +1042,33 @@ app.get('/api/auth/callback/google', async (req, res) => {
               return res.status(500).send('Session creation failed.');
             }
 
-            res.cookie('sso_session_id', sessionId, {
-              httpOnly: true,
-              path: '/',
-              sameSite: 'lax',
-              secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
-              maxAge: 24 * 60 * 60 * 1000
-            });
+            setSSOSessionCookie(req, res, sessionId);
 
-            if (client_id && redirect_uri) {
-              db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
-
-              isTrustedRedirect(client_id, redirect_uri, (trusted) => {
-                if (!trusted) {
-                  return renderConsentPage(res, { email: finalUserEmail, clientId: client_id, redirectUri: redirect_uri });
+            getAppGoogleScopes(client_id, (extraScopes) => {
+              saveAppGoogleTokens(finalUserEmail, client_id, tokens, extraScopes, (tokenSaveErr) => {
+                if (tokenSaveErr) {
+                  console.error('Failed to persist Google OAuth tokens:', tokenSaveErr);
+                  return res.status(500).send('Failed to save Google authorization tokens.');
                 }
-                createAuthCode(finalUserEmail, client_id, redirect_uri, (codeErr, code) => {
-                  if (codeErr) return res.status(500).send('Auth code creation failed.');
-                  const separator = redirect_uri.includes('?') ? '&' : '?';
-                  res.redirect(`${redirect_uri}${separator}code=${code}`);
-                });
+
+                if (client_id && redirect_uri) {
+                  db.run('INSERT OR IGNORE INTO session_clients (sso_session_id, client_id) VALUES (?, ?)', [sessionId, client_id]);
+
+                  isTrustedRedirect(client_id, redirect_uri, (trusted) => {
+                    if (!trusted) {
+                      return renderConsentPage(res, { email: finalUserEmail, clientId: client_id, redirectUri: redirect_uri });
+                    }
+                    createAuthCode(finalUserEmail, client_id, redirect_uri, (codeErr, authCode) => {
+                      if (codeErr) return res.status(500).send('Auth code creation failed.');
+                      const separator = redirect_uri.includes('?') ? '&' : '?';
+                      res.redirect(`${redirect_uri}${separator}code=${authCode}`);
+                    });
+                  });
+                } else {
+                  res.redirect('/');
+                }
               });
-            } else {
-              res.redirect('/');
-            }
+            });
           }
         );
       };
@@ -872,6 +1095,120 @@ app.get('/api/auth/callback/google', async (req, res) => {
     console.error('Google OAuth Error:', error);
     res.redirect('/?error=oauth_failed');
   }
+});
+
+// 8.1 Refresh per-app Google OAuth access token
+app.post('/api/auth/google/refresh', (req, res) => {
+  const { client_id, session_token } = req.body || {};
+  if (!client_id || !session_token) {
+    return res.status(400).json({ error: 'Missing client_id or session_token.' });
+  }
+
+  db.get(
+    'SELECT email, client_id, refresh_token, scope FROM google_tokens WHERE client_id = ? AND session_token = ?',
+    [client_id, session_token],
+    async (err, row) => {
+      if (err) {
+        console.error('Database error reading google_tokens:', err);
+        return res.status(500).json({ error: 'Database error.' });
+      }
+      if (!row || !row.refresh_token) {
+        return res.status(401).json({ error: 'reauth_required' });
+      }
+
+      try {
+        const client = getGoogleClient(req);
+        client.setCredentials({ refresh_token: row.refresh_token });
+        const { credentials } = await client.refreshAccessToken();
+
+        if (!credentials || !credentials.access_token) {
+          return res.status(401).json({ error: 'reauth_required' });
+        }
+
+        const accessToken = credentials.access_token;
+        const expiresAtUnix = credentials.expiry_date
+          ? Math.floor(credentials.expiry_date / 1000)
+          : Math.floor(Date.now() / 1000) + 3600;
+        const scope = credentials.scope || row.scope;
+
+        db.run(
+          `UPDATE google_tokens
+           SET access_token = ?, expires_at_unix = ?, scope = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE email = ? AND client_id = ?`,
+          [accessToken, expiresAtUnix, scope, row.email, row.client_id],
+          (updateErr) => {
+            if (updateErr) {
+              console.error('Failed to update refreshed google_tokens:', updateErr);
+              return res.status(500).json({ error: 'Failed to update refreshed token.' });
+            }
+            res.status(200).json({
+              success: true,
+              accessToken,
+              expiresAtUnix,
+              scope
+            });
+          }
+        );
+      } catch (refreshErr) {
+        console.error('Google token refresh failed:', refreshErr.message);
+        const oauthErrCode = refreshErr?.response?.data?.error;
+        const status = refreshErr?.response?.status ?? refreshErr?.status;
+        const isInvalidGrant = oauthErrCode === 'invalid_grant' || String(refreshErr?.message || '').includes('invalid_grant');
+        if (isInvalidGrant || status === 400 || status === 401) {
+          if (isInvalidGrant) {
+            db.run('UPDATE google_tokens SET refresh_token = NULL, updated_at = CURRENT_TIMESTAMP WHERE email = ? AND client_id = ?', [row.email, row.client_id]);
+          }
+          return res.status(401).json({ error: 'reauth_required' });
+        }
+        res.status(502).json({ error: 'Failed to refresh Google access token.' });
+      }
+    }
+  );
+});
+
+// 8.2 Disconnect / revoke per-app Google OAuth tokens
+app.post('/api/auth/google/disconnect', (req, res) => {
+  const { client_id, session_token } = req.body || {};
+  if (!client_id || !session_token) {
+    return res.status(400).json({ error: 'Missing client_id or session_token.' });
+  }
+
+  db.get(
+    'SELECT access_token, refresh_token FROM google_tokens WHERE client_id = ? AND session_token = ?',
+    [client_id, session_token],
+    async (err, row) => {
+      if (err) {
+        console.error('Database error reading google_tokens for disconnect:', err);
+        return res.status(500).json({ error: 'Database error.' });
+      }
+
+      if (row) {
+        const tokenToRevoke = row.refresh_token || row.access_token;
+        if (tokenToRevoke) {
+          try {
+            await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(tokenToRevoke)}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            });
+          } catch (revokeErr) {
+            console.warn('Best-effort Google token revoke failed:', revokeErr.message);
+          }
+        }
+      }
+
+      db.run(
+        'DELETE FROM google_tokens WHERE client_id = ? AND session_token = ?',
+        [client_id, session_token],
+        (delErr) => {
+          if (delErr) {
+            console.error('Failed to delete google_tokens on disconnect:', delErr);
+            return res.status(500).json({ error: 'Failed to disconnect Google tokens.' });
+          }
+          res.status(200).json({ success: true });
+        }
+      );
+    }
+  );
 });
 
 // Helper to render custom 404 HTML page for missing resources
